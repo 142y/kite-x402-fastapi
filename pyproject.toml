@@ -28,3 +28,7 @@ where = ["src"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# Make the repo root importable (``tests.conftest``) and the package importable
+# from source, regardless of whether pytest is invoked as ``pytest`` or
+# ``python -m pytest``.
+pythonpath = [".", "src"]
