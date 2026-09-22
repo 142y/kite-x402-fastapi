@@ -1,0 +1,30 @@
+[project]
+name = "kite-x402-fastapi"
+version = "0.1.0"
+description = "Python/FastAPI x402 wrapper template for paid services on the Kite network"
+readme = "README.md"
+license = { text = "Apache-2.0" }
+authors = [{ name = "Kite x402 contributors" }]
+requires-python = ">=3.10"
+dependencies = [
+    "x402[fastapi,evm]>=2.3.0",
+    "fastapi>=0.115.0",
+    "uvicorn>=0.30.0",
+    "httpx>=0.27.0",
+    "python-dotenv>=1.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
