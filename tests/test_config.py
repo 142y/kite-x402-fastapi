@@ -58,3 +58,41 @@ def test_bad_network():
         load_settings(
             {"PAY_TO": "0xAbC", "UPSTREAM_URL": "https://api.example.com", "KITE_NETWORK": "x"}
         )
+
+
+class TestLimits:
+    ENV = {
+        "PAY_TO": "0xAbC0000000000000000000000000000000000001",
+        "UPSTREAM_URL": "https://api.example.com",
+    }
+
+    def test_limit_defaults(self):
+        settings = load_settings(dict(self.ENV))
+        assert settings.allowed_methods == (
+            "GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS",
+        )
+        assert settings.max_body_bytes == 10 * 1024 * 1024
+        assert settings.upstream_timeout == 30.0
+
+    def test_allowed_methods_normalized(self):
+        settings = load_settings({**self.ENV, "ALLOWED_METHODS": " get, post ,, "})
+        assert settings.allowed_methods == ("GET", "POST")
+
+    def test_empty_allowed_methods_rejected(self):
+        with pytest.raises(ValueError, match="ALLOWED_METHODS"):
+            load_settings({**self.ENV, "ALLOWED_METHODS": ",,"})
+
+    def test_bad_max_body_bytes(self):
+        with pytest.raises(ValueError, match="MAX_BODY_BYTES"):
+            load_settings({**self.ENV, "MAX_BODY_BYTES": "0"})
+
+    def test_bad_upstream_timeout(self):
+        with pytest.raises(ValueError, match="UPSTREAM_TIMEOUT"):
+            load_settings({**self.ENV, "UPSTREAM_TIMEOUT": "-1"})
+
+    def test_limits_accepted(self):
+        settings = load_settings(
+            {**self.ENV, "MAX_BODY_BYTES": "2048", "UPSTREAM_TIMEOUT": "0.5"}
+        )
+        assert settings.max_body_bytes == 2048
+        assert settings.upstream_timeout == 0.5

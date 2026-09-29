@@ -13,11 +13,13 @@ same route prefix, same settle-on-success rule.
 
 from __future__ import annotations
 
+import json
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, StreamingResponse
+from starlette.background import BackgroundTask
 from x402 import x402ResourceServer
 from x402.http import HTTPFacilitatorClient
 from x402.http.middleware.fastapi import payment_middleware
@@ -29,8 +31,6 @@ from .proxy import (
     upstream_response_headers,
     upstream_target_url,
 )
-
-DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
 
 
 def create_app(
@@ -91,13 +91,84 @@ def create_app(
             "price": f"${settings.price_usd}",
         }
 
-    # 3. Proxy paid requests to the API being wrapped. The upstream credential
-    #    is injected here and never reaches the caller.
-    owns_client = upstream_client is None
-    client = upstream_client or httpx.AsyncClient(timeout=DEFAULT_TIMEOUT)
+    @app.get("/readyz")
+    async def readyz() -> Response:
+        """Live probe: can the configured facilitator be reached right now?
 
-    @app.api_route("/v1/{upstream_path:path}", methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"])
+        Unlike /healthz this actually calls the facilitator's /supported
+        endpoint and reports whether the configured Kite network is offered,
+        so orchestrators can distinguish "process up" from "able to charge".
+        """
+        try:
+            supported = await facilitator.supported()
+            offered = json.dumps(supported, default=str)
+        except Exception as err:  # noqa: BLE001 - any failure means not ready
+            return JSONResponse(
+                status_code=503,
+                content={
+                    "ok": False,
+                    "facilitator": settings.facilitator_url,
+                    "error": str(err),
+                },
+            )
+        return {
+            "ok": True,
+            "facilitator": settings.facilitator_url,
+            "network": settings.chain.network,
+            "network_listed": settings.chain.network in offered,
+        }
+
+    # 3. Proxy paid requests to the API being wrapped. The upstream credential
+    #    is injected here and never reaches the caller. Responses are streamed
+    #    through (no full-body buffering) so large payloads do not pile up in
+    #    memory; the upstream connection closes when the stream finishes.
+    owns_client = upstream_client is None
+    client = upstream_client or httpx.AsyncClient(
+        timeout=httpx.Timeout(settings.upstream_timeout, connect=10.0)
+    )
+
+    # Register every method the middleware can charge for; the per-request
+    # whitelist below decides which ones actually get proxied, so a disallowed
+    # method gets a uniform JSON 405 (with Allow) instead of the router's.
+    @app.api_route(
+        "/v1/{upstream_path:path}",
+        methods=["GET", "HEAD", "POST", "PUT", "PATCH", "DELETE", "OPTIONS"],
+    )
     async def proxy(upstream_path: str, request: Request) -> Response:
+        if request.method not in settings.allowed_methods:
+            # Reached only when the middleware already let the call through:
+            # never proxied, never settled.
+            return JSONResponse(
+                status_code=405,
+                content={
+                    "error": "method not allowed",
+                    "allowed": list(settings.allowed_methods),
+                },
+                headers={"Allow": ", ".join(settings.allowed_methods)},
+            )
+
+        # Reject oversized bodies before touching the upstream or settling
+        # anything. Content-Length is checked first so chunked uploads without
+        # one still get caught after the body is read.
+        declared = request.headers.get("content-length", "")
+        if declared.isdigit() and int(declared) > settings.max_body_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": "request body too large",
+                    "limit_bytes": settings.max_body_bytes,
+                },
+            )
+        body = await request.body()
+        if len(body) > settings.max_body_bytes:
+            return JSONResponse(
+                status_code=413,
+                content={
+                    "error": "request body too large",
+                    "limit_bytes": settings.max_body_bytes,
+                },
+            )
+
         # scope["query_string"] is raw bytes and keeps multi-value params intact.
         query_string = request.scope.get("query_string", b"")
         if isinstance(query_string, bytes):
@@ -108,24 +179,25 @@ def create_app(
             settings.upstream_auth_header,
             settings.upstream_auth_value,
         )
-        body = await request.body()
+        stream = client.stream(
+            request.method,
+            target,
+            headers=headers,
+            content=body if request.method not in ("GET", "HEAD") else None,
+        )
         try:
-            upstream_response = await client.request(
-                request.method,
-                target,
-                headers=headers,
-                content=body if request.method not in ("GET", "HEAD") else None,
-            )
+            upstream_response = await stream.__aenter__()
         except httpx.HTTPError as err:
             # 502 is >= 400, so the payment middleware does not settle the charge.
             return JSONResponse(
                 status_code=502, content={"error": "upstream unreachable", "detail": str(err)}
             )
 
-        return Response(
+        return StreamingResponse(
+            upstream_response.aiter_bytes(),
             status_code=upstream_response.status_code,
             headers=upstream_response_headers(upstream_response.headers),
-            content=upstream_response.content,
+            background=BackgroundTask(stream.__aexit__, None, None, None),
         )
 
     if owns_client:

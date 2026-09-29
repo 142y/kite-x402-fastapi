@@ -83,7 +83,8 @@ header that decodes to:
 ```
 
 Every path under `/v1/` is paid and proxied to `UPSTREAM_URL` with the `/v1`
-prefix stripped. `/healthz` is free. That is the whole contract.
+prefix stripped. `/healthz` (process up) and `/readyz` (facilitator reachable)
+are free. That is the whole contract.
 
 ## Environment variables
 
@@ -100,14 +101,33 @@ Same set as the official templates:
 | `SERVICE_DESCRIPTION` | Shown in the 402 challenge resource info | — |
 | `PORT` | Listen port | `8080` |
 | `FACILITATOR_URL` | Facilitator base URL (keep the `/v2`!) | `https://facilitator.pieverse.io/v2` |
+| `ALLOWED_METHODS` | Comma-separated methods that may be proxied; anything else gets `405` and is never proxied or settled | all of GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS |
+| `MAX_BODY_BYTES` | Request body cap; oversized requests get `413` before the upstream is contacted or anything settles | `10485760` (10 MiB) |
+| `UPSTREAM_TIMEOUT` | Total budget for one upstream call, seconds | `30` |
 
 ## Payment ordering
 
 `verify → upstream → settle`, always. The x402 middleware settles the payment
 only after your upstream responds with a status below 400, so an unreachable
-upstream (this wrapper returns `502`) or an upstream error never charges the
-buyer. Charging before validating is the number one complaint about paid APIs
-from agents; do not reorder this.
+upstream (this wrapper returns `502`), a request rejected by the guard rails
+(`405`/`413`), or an upstream error never charges the buyer. Charging before
+validating is the number one complaint about paid APIs from agents; do not
+reorder this.
+
+Upstream responses are **streamed** to the caller — the wrapper never buffers
+a full body in memory, so large payloads cost constant proxy memory. Note the
+consequence: the settle decision is made from the upstream status line, which
+arrives before the body. If the upstream dies mid-stream the charge stands but
+the response breaks; that is the same trade-off every streaming gateway makes.
+The stale `Content-Encoding` header from the upstream is dropped (httpx already
+decoded the body), so the caller's HTTP stack never tries to gunzip twice.
+
+## Readiness
+
+`GET /readyz` actually calls the facilitator's `/supported` endpoint and reports
+whether the configured Kite network is currently offered, so orchestrators can
+distinguish "process up" (`/healthz`) from "able to charge" (`/readyz`). It
+returns `503` with the error when the facilitator cannot be reached.
 
 ## Tests
 
@@ -116,11 +136,13 @@ pip install -e ".[dev]"
 pytest -v
 ```
 
-46 tests pin the contract: the 402 challenge shape (Kite network, asset,
+60 tests pin the contract: the 402 challenge shape (Kite network, asset,
 atomic-unit amount, EIP-712 domain), USD→atomic-unit conversion edge cases,
 header hygiene (hop-by-hop stripping, credential injection,
-`PAYMENT-SIGNATURE` never forwarded), the proxy path/query/body mapping, and
-the verify → upstream → settle ordering including the settle-only-on-success
+`PAYMENT-SIGNATURE` never forwarded), the proxy path/query/body mapping,
+streaming responses (large payloads, stale `Content-Encoding`), the guard
+rails (method whitelist, body cap, timeouts), readiness probing, and the
+verify → upstream → settle ordering including the settle-only-on-success
 rule — all against a stub facilitator and a mock upstream, no network needed.
 
 CI (`.github/workflows/ci.yml`) runs the suite on Python 3.10–3.13 and boots
