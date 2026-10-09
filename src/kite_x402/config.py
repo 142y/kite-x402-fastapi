@@ -28,6 +28,15 @@ DEFAULT_MAX_BODY_BYTES = 10 * 1024 * 1024
 #: Default upstream call budget in seconds, tunable via UPSTREAM_TIMEOUT.
 DEFAULT_UPSTREAM_TIMEOUT = 30.0
 
+#: Truthy strings that keep the JSON access log enabled (ACCESS_LOG).
+_TRUTHY = frozenset({"1", "true", "yes", "on"})
+
+
+def _env_flag(value: str, default: bool) -> bool:
+    if not value:
+        return default
+    return value.strip().lower() in _TRUTHY
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -46,6 +55,7 @@ class Settings:
     allowed_methods: tuple[str, ...] = DEFAULT_METHODS
     max_body_bytes: int = DEFAULT_MAX_BODY_BYTES
     upstream_timeout: float = DEFAULT_UPSTREAM_TIMEOUT
+    access_log: bool = True
 
 
 def load_settings(env: dict[str, str] | None = None) -> Settings:
@@ -86,6 +96,8 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
     if upstream_timeout <= 0:
         raise ValueError(f"UPSTREAM_TIMEOUT must be positive, got {upstream_timeout}")
 
+    access_log = _env_flag(get("ACCESS_LOG"), default=True)
+
     return Settings(
         pay_to=pay_to,
         chain=chain,
@@ -100,4 +112,5 @@ def load_settings(env: dict[str, str] | None = None) -> Settings:
         allowed_methods=allowed_methods,
         max_body_bytes=max_body_bytes,
         upstream_timeout=upstream_timeout,
+        access_log=access_log,
     )

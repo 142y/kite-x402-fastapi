@@ -14,11 +14,14 @@ same route prefix, same settle-on-success rule.
 from __future__ import annotations
 
 import json
+import logging
+import time
+import uuid
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, Request, Response
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import JSONResponse, PlainTextResponse, StreamingResponse
 from starlette.background import BackgroundTask
 from x402 import x402ResourceServer
 from x402.http import HTTPFacilitatorClient
@@ -26,11 +29,15 @@ from x402.http.middleware.fastapi import payment_middleware
 from x402.mechanisms.evm.exact import ExactEvmServerScheme
 
 from .config import Settings, load_settings
+from .metrics import Metrics, route_label
 from .proxy import (
     upstream_request_headers,
     upstream_response_headers,
     upstream_target_url,
 )
+
+#: One structured JSON line per request, ready for log drains to pick up.
+access_logger = logging.getLogger("kite_x402.access")
 
 
 def create_app(
@@ -82,6 +89,42 @@ def create_app(
     async def x402_gate(request: Request, call_next):  # type: ignore[no-untyped-def]
         return await middleware(request, call_next)
 
+    # 2b. Observability: request IDs, one JSON access-log line per request and
+    # in-process counters exposed at /metrics. Registered after the payment
+    # gate so it is the *outermost* middleware: unpaid 402 challenges and
+    # guard-rail rejections are measured and logged too, not just successes.
+    metrics = Metrics()
+    app.state.metrics = metrics
+
+    @app.middleware("http")
+    async def observability(request: Request, call_next):  # type: ignore[no-untyped-def]
+        # Echo the caller's ID when provided (agents that set X-Request-ID can
+        # correlate their own logs), otherwise mint one for this request.
+        request_id = (request.headers.get("x-request-id") or "").strip() or uuid.uuid4().hex
+        request.state.request_id = request_id
+        started = time.perf_counter()
+        response = await call_next(request)
+        duration_ms = (time.perf_counter() - started) * 1000
+        response.headers["X-Request-ID"] = request_id
+        route = route_label(request.url.path)
+        metrics.inc("kite_http_requests_total", route=route, status=str(response.status_code))
+        if settings.access_log:
+            access_logger.info(
+                json.dumps(
+                    {
+                        "msg": "access",
+                        "request_id": request_id,
+                        "method": request.method,
+                        "path": request.url.path,
+                        "route": route,
+                        "status": response.status_code,
+                        "duration_ms": round(duration_ms, 3),
+                    },
+                    separators=(",", ":"),
+                )
+            )
+        return response
+
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         return {
@@ -117,6 +160,19 @@ def create_app(
             "network": settings.chain.network,
             "network_listed": settings.chain.network in offered,
         }
+
+    @app.get("/metrics")
+    async def metrics_endpoint() -> PlainTextResponse:
+        """Prometheus text format; free to scrape, no payment required.
+
+        Counters and histograms live in-process (no client library, no
+        sidecar), which is enough for a single-instance wrapper and keeps the
+        deployment story to one container.
+        """
+        return PlainTextResponse(
+            metrics.render(),
+            media_type="text/plain; version=0.0.4; charset=utf-8",
+        )
 
     # 3. Proxy paid requests to the API being wrapped. The upstream credential
     #    is injected here and never reaches the caller. Responses are streamed
@@ -179,19 +235,31 @@ def create_app(
             settings.upstream_auth_header,
             settings.upstream_auth_value,
         )
+        # Correlate wrapper and upstream logs with one request ID. The
+        # caller-supplied value (if any) already won in the observability
+        # middleware, so this is the same ID echoed back to them.
+        headers["x-request-id"] = request.state.request_id
         stream = client.stream(
             request.method,
             target,
             headers=headers,
             content=body if request.method not in ("GET", "HEAD") else None,
         )
+        ttfb_started = time.perf_counter()
         try:
             upstream_response = await stream.__aenter__()
         except httpx.HTTPError as err:
             # 502 is >= 400, so the payment middleware does not settle the charge.
+            metrics.inc("kite_upstream_failures_total")
             return JSONResponse(
                 status_code=502, content={"error": "upstream unreachable", "detail": str(err)}
             )
+        # Time-to-first-byte: the body streams after this, so wall-clock here
+        # covers connect + upstream processing, the part the wrapper controls.
+        metrics.observe(
+            "kite_upstream_request_duration_ms",
+            (time.perf_counter() - ttfb_started) * 1000,
+        )
 
         return StreamingResponse(
             upstream_response.aiter_bytes(),

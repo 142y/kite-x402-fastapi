@@ -104,6 +104,7 @@ Same set as the official templates:
 | `ALLOWED_METHODS` | Comma-separated methods that may be proxied; anything else gets `405` and is never proxied or settled | all of GET/HEAD/POST/PUT/PATCH/DELETE/OPTIONS |
 | `MAX_BODY_BYTES` | Request body cap; oversized requests get `413` before the upstream is contacted or anything settles | `10485760` (10 MiB) |
 | `UPSTREAM_TIMEOUT` | Total budget for one upstream call, seconds | `30` |
+| `ACCESS_LOG` | Emit one JSON access-log line per request (`true`/`false`) | `true` |
 
 ## Payment ordering
 
@@ -129,6 +130,39 @@ whether the configured Kite network is currently offered, so orchestrators can
 distinguish "process up" (`/healthz`) from "able to charge" (`/readyz`). It
 returns `503` with the error when the facilitator cannot be reached.
 
+## Observability
+
+Every response carries an `X-Request-ID`. If the caller sends one it is echoed
+back unchanged; otherwise the wrapper mints a UUID and returns it. The same ID
+is forwarded to the upstream as `x-request-id` and written into the access log,
+so one ID lines up the agent's logs, the wrapper's logs and the upstream's
+logs.
+
+With `ACCESS_LOG=true` (default) the wrapper emits one JSON line per request —
+including unpaid `402` challenges and guard-rail rejections — on the
+`kite_x402.access` logger:
+
+```json
+{"msg":"access","request_id":"9d4c…","method":"GET","path":"/v1/forecast","route":"v1","status":"200","duration_ms":184.2}
+```
+
+`GET /metrics` (free, no payment) exposes counters and an upstream latency
+histogram in the Prometheus text format, no client library or sidecar needed:
+
+```
+kite_http_requests_total{route="v1",status="200"} 3
+kite_http_requests_total{route="v1",status="402"} 11
+kite_upstream_request_duration_ms_bucket{le="250"} 3
+kite_upstream_request_duration_ms_count 3
+kite_upstream_failures_total 0
+```
+
+`route` is a fixed label set (`v1` / `healthz` / `readyz` / `metrics` /
+`other`), so label cardinality stays bounded no matter how many distinct paths
+agents call. The latency histogram measures time-to-first-byte from the
+upstream — connect plus upstream processing, the part the wrapper controls —
+because the body itself streams to the caller afterwards.
+
 ## Tests
 
 ```bash
@@ -141,9 +175,11 @@ atomic-unit amount, EIP-712 domain), USD→atomic-unit conversion edge cases,
 header hygiene (hop-by-hop stripping, credential injection,
 `PAYMENT-SIGNATURE` never forwarded), the proxy path/query/body mapping,
 streaming responses (large payloads, stale `Content-Encoding`), the guard
-rails (method whitelist, body cap, timeouts), readiness probing, and the
-verify → upstream → settle ordering including the settle-only-on-success
-rule — all against a stub facilitator and a mock upstream, no network needed.
+rails (method whitelist, body cap, timeouts), readiness probing, request-ID
+propagation, the JSON access log, the Prometheus exposition (including label
+escaping and upstream-failure accounting), and the verify → upstream → settle
+ordering including the settle-only-on-success rule — all against a stub
+facilitator and a mock upstream, no network needed.
 
 CI (`.github/workflows/ci.yml`) runs the suite on Python 3.10–3.13 and boots
 the wrapper to confirm the live 402 behaviour.
@@ -156,6 +192,17 @@ tunnels do not work. Set `KITE_NETWORK=testnet` first and pay yourself once
 with a sandbox agent (free pieUSD) before going live — see the
 [upstream README](https://github.com/gokite-ai/kite-x402-services#test-with-a-kite-passport-agent)
 for the `kpass` walkthrough.
+
+For container platforms there is a multi-stage `Dockerfile` (runtime image is
+just the installed package on `python:3.12-slim`, running as non-root,
+everything configured through the environment):
+
+```bash
+docker build -t kite-x402-fastapi .
+docker run --rm -p 8080:8080 \
+  -e PAY_TO=0xYourKiteWallet -e UPSTREAM_URL=https://api.open-meteo.com \
+  kite-x402-fastapi
+```
 
 Never commit `.env` or upstream keys.
 
@@ -175,8 +222,10 @@ Never commit `.env` or upstream keys.
 src/kite_x402/kite.py     Kite chain constants, USD → atomic-unit pricing
 src/kite_x402/config.py   Environment parsing and validation
 src/kite_x402/proxy.py    Reverse-proxy URL/header rules (RFC 9110 hygiene)
+src/kite_x402/metrics.py  In-process counters + Prometheus text exposition
 src/kite_x402/app.py      FastAPI app: /healthz free, /v1/* paid + proxied
 tests/                    Contract tests (stub facilitator + mock upstream)
+Dockerfile                Multi-stage container build (non-root runtime)
 ```
 
 ## License
